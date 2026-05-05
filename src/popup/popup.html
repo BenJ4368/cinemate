@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Cinemate</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="curtain curtain-left"></div>
+  <div class="curtain curtain-right"></div>
+
+  <header>
+    <div class="marquee">
+      <span class="marquee-bulb"></span>
+      <h1>CINEMATE</h1>
+      <span class="marquee-bulb"></span>
+    </div>
+    <p class="subtitle">— Séance partagée —</p>
+  </header>
+
+  <main>
+    <!-- STEP 1 — Pseudo (toujours visible, obligatoire) -->
+    <section class="step step-pseudo" id="pseudo-section" aria-labelledby="step1-title">
+      <div class="step-header">
+        <span class="step-num" aria-hidden="true">1</span>
+        <span class="step-title" id="step1-title">Ton pseudo <em class="required">(obligatoire)</em></span>
+      </div>
+      <label class="visually-hidden" for="pseudo">Pseudo (obligatoire)</label>
+      <input type="text" id="pseudo" placeholder="Entre ton pseudo…" autocomplete="off"
+             maxlength="32" aria-required="true" />
+    </section>
+
+    <!-- STEP 2 — Actions (grisé tant que pseudo vide) -->
+    <section class="step step-actions" id="actions-section" aria-labelledby="step2-title">
+      <div class="step-header">
+        <span class="step-num" aria-hidden="true">2</span>
+        <span class="step-title" id="step2-title">Crée ou rejoins une salle</span>
+      </div>
+
+      <div class="action-block">
+        <button id="create-btn" type="button" disabled aria-label="Créer une nouvelle salle">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label"><span class="ticket-icon" aria-hidden="true"></span> Créer une salle</span>
+        </button>
+        <p id="no-video-hint" class="hint hidden">Aucune vidéo détectée sur cet onglet.</p>
+        <p id="pseudo-required-hint" class="hint">↑ Entre d'abord un pseudo.</p>
+      </div>
+
+      <div class="separator" aria-hidden="true"><span>OU</span></div>
+
+      <div class="action-block">
+        <label class="visually-hidden" for="join-id">ID de la salle</label>
+        <input type="text" id="join-id" placeholder="Coller l'ID de la salle" autocomplete="off" disabled />
+        <button id="join-btn" type="button" disabled aria-label="Rejoindre la salle">
+          <span class="btn-spinner" aria-hidden="true"></span>
+          <span class="btn-label">Rejoindre</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- En salle -->
+    <section class="step step-status hidden" id="status-section" aria-live="polite">
+      <p id="status-text"></p>
+      <div id="room-id-row" class="hidden">
+        <label class="visually-hidden" for="room-id-display">ID de la salle</label>
+        <input type="text" id="room-id-display" readonly />
+        <button id="copy-btn" type="button" aria-label="Copier l'ID dans le presse-papier">Copier</button>
+      </div>
+      <ul id="members-list" aria-label="Membres de la salle"></ul>
+      <button id="leave-btn" type="button" class="danger">Quitter la salle</button>
+    </section>
+  </main>
+
+  <p id="error" class="error hidden" role="alert"></p>
+
+  <script src="popup.js"></script>
+</body>
+</html>
