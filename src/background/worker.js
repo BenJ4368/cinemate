@@ -158,13 +158,18 @@ function startHostHeartbeat(room) {
     if (!room.isHost) return;
     const state = hostStates.get(room.windowId);
     if (!state) return;
-    console.log('[cinemate] heartbeat', state)
+    // Projection côté hôte (horloge locale) avant broadcast : on évite que
+    // l'invité fasse Date.now() - msg.recordedAt avec deux horloges
+    // distinctes (skew NTP + RTT) → seek parasite avant lecture.
+    const projectedCurrentTime = state.paused
+      ? state.currentTime
+      : state.currentTime + (Date.now() - state.recordedAt) / 1000;
+    console.log('[cinemate] heartbeat', state);
     broadcast(room, {
       type: 'HEARTBEAT',
       url: state.url,
-      currentTime: state.currentTime,
-      paused: state.paused,
-      recordedAt: state.recordedAt
+      currentTime: projectedCurrentTime,
+      paused: state.paused
     });
   }, HEARTBEAT_MS);
 }
@@ -197,16 +202,21 @@ async function followHostUrl(room, msg) {
   if (tab.url !== msg.url) {
     try {
       await browser.tabs.update(target, { url: msg.url });
-      // Wait for the new page's content script before applying sync
+      // Wait for the new page's content script before applying sync.
+      // msg.currentTime déjà projeté côté hôte. On ajoute le délai d'attente
+      // pour rattraper la lecture qui a continué pendant le chargement.
+      const REDIRECT_WAIT_MS = 2500;
       setTimeout(() => {
-        const projected = msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000);
+        const projected = msg.paused
+          ? msg.currentTime
+          : msg.currentTime + REDIRECT_WAIT_MS / 1000;
         sendToContent(room.windowId, {
           type: 'APPLY_SYNC',
           action: 'seek',
           currentTime: projected,
           paused: msg.paused
         });
-      }, 2500);
+      }, REDIRECT_WAIT_MS);
       return true;
     } catch (e) {
       console.warn('[cinemate] could not redirect tab', e);
@@ -282,31 +292,35 @@ function setupGuestConnection(room, conn) {
     try { msg = JSON.parse(raw); } catch (_) { return; }
 
     if (msg.type === 'INITIAL_STATE') {
+      // currentTime déjà projeté à "host now" via compensatedState côté hôte.
+      // Pas de re-projection ici (horloges non synchronisées entre machines).
       const redirected = await followHostUrl(room, msg);
       if (!redirected) {
         sendToContent(room.windowId, {
           type: 'APPLY_SYNC',
           action: 'seek',
-          currentTime: msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000),
+          currentTime: msg.currentTime,
           paused: msg.paused
         });
       }
     } else if (msg.type === 'VIDEO_EVENT') {
+      // currentTime = position hôte exacte au moment de l'event.
+      // Pas de projection cross-horloge → l'invité ne voit pas de micro-seek
+      // parasite avant lecture.
       sendToContent(room.windowId, {
         type: 'APPLY_SYNC',
         action: msg.action,
-        currentTime: msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000),
+        currentTime: msg.currentTime,
         paused: msg.paused
       });
     } else if (msg.type === 'HEARTBEAT') {
       // Suivi d'URL : si l'hôte a changé de vidéo, on redirige l'onglet invité.
       const redirected = await followHostUrl(room, msg);
       if (!redirected) {
-        // Sinon on demande au content script de vérifier le drift (>1s déclenche reposition).
-        const projected = msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000);
+        // currentTime déjà projeté côté hôte avant broadcast.
         sendToContent(room.windowId, {
           type: 'CHECK_DRIFT',
-          currentTime: projected,
+          currentTime: msg.currentTime,
           paused: msg.paused
         });
       }
