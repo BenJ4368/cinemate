@@ -61,8 +61,22 @@ function registerVideo(action) {
   }).catch(() => {});
 }
 
+let lastEventAction = null;
+let lastEventTs = 0;
+
 function sendVideoEvent(action) {
   if (!video || !inRoom || !isHost || isSyncing) return;
+  const now = Date.now();
+  // Squash : YouTube/MSE peut émettre 'seeked' juste après 'play'/'pause'
+  // (snap keyframe, ajustement buffer). Ce seek interne, broadcast tel quel,
+  // fait re-seek l'invité sur une position légèrement différente → saut visible.
+  if (action === 'seek'
+      && (lastEventAction === 'play' || lastEventAction === 'pause')
+      && now - lastEventTs < 500) {
+    return;
+  }
+  lastEventAction = action;
+  lastEventTs = now;
   browser.runtime.sendMessage({
     type: 'VIDEO_EVENT',
     action,
@@ -133,7 +147,14 @@ function applySync(msg) {
     // que video.currentTime reste figé → saut en avant visible.
     const onPlaying = () => {
       video.removeEventListener('playing', onPlaying);
-      if (lastSync) lastSync.ts = Date.now();
+      // Re-aligne lastSync sur l'état réel du player au moment où la lecture
+      // démarre vraiment : video.currentTime peut avoir été déplacé par le
+      // player (snap keyframe YouTube) pendant le warmup, sinon enforceGuestState
+      // sur-estimerait l'écart et provoquerait un saut arrière.
+      if (lastSync) {
+        lastSync.ts = Date.now();
+        lastSync.currentTime = video.currentTime;
+      }
     };
     video.addEventListener('playing', onPlaying);
     // Fenêtre isSyncing étendue : couvre le warmup pour ignorer les events
