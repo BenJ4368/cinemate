@@ -328,10 +328,10 @@ document.addEventListener('keydown', (e) => {
   }
 }, true /* capture phase, passe avant le player */);
 
-// Periodic enforcement for guests (handles custom players that bypass our listeners)
-setInterval(() => {
-  if (inRoom && !isHost && video && lastSync) enforceGuestState();
-}, 1000);
+// Pas d'enforcement périodique côté invité : c'était ce qui causait des
+// saccades visibles toutes les secondes en cas de petit décalage naturel
+// (buffering, frames perdues). La correction passe désormais uniquement par
+// les events du player et le CHECK_DRIFT du heartbeat (toutes les 3s, seuil 1s).
 
 // Periodically refresh hostState for the background (host only)
 setInterval(() => {

@@ -57,6 +57,11 @@ async function init() {
   });
   joinIdInput.addEventListener('input', () => { refreshButtons(); clearError(); });
 
+  // Mettre à jour l'état des boutons/champ avant de poser le focus :
+  // sinon joinIdInput est encore disabled (attribut HTML par défaut) et
+  // le focus ne s'applique pas (cf. T115).
+  refreshButtons();
+
   // Autofocus : si pas de pseudo, on focus dessus ; sinon sur le champ rejoindre.
   setTimeout(() => {
     if (!pseudoInput.value.trim()) pseudoInput.focus();
@@ -66,6 +71,34 @@ async function init() {
   // Touche Entrée dans le champ ID = rejoindre directement
   joinIdInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !joinBtn.disabled) joinBtn.click();
+  });
+
+  // Boucle de focus : Tab depuis le dernier élément actif → premier ; Shift+Tab
+  // depuis le premier → dernier. Sans ça, le focus s'évade vers la barre d'URL
+  // et on ne peut plus revenir au champ pseudo (cf. T110).
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Tab') return;
+    const focusables = Array.from(document.querySelectorAll(
+      'input:not([disabled]):not(.hidden), button:not([disabled]):not(.hidden), [tabindex]:not([tabindex="-1"])'
+    )).filter((el) => {
+      // Exclut les éléments dans une section masquée
+      let node = el;
+      while (node) {
+        if (node.classList && node.classList.contains('hidden')) return false;
+        node = node.parentElement;
+      }
+      return true;
+    });
+    if (focusables.length === 0) return;
+    const first = focusables[0];
+    const last = focusables[focusables.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
   });
 
   // Resolve current window/tab

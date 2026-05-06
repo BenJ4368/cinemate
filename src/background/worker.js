@@ -331,6 +331,9 @@ function setupGuestConnection(room, conn) {
 
   conn.on('close', () => {
     room.connections.delete(conn.peer);
+    // Si on est en train de quitter volontairement, on ne déclenche pas
+    // le toast "hôte parti" — c'est nous qui fermons la connexion.
+    if (room.leaving) return;
     if (conn.peer === room.hostPeerId) {
       // L'hôte a quitté → la salle est dissoute pour tous les invités.
       leaveRoomAndNotify(room.windowId, "L'hôte a quitté — la salle est dissoute");
@@ -393,26 +396,49 @@ function joinRoom(windowId, pseudo, roomId) {
       selfPeerId: null, hostPeerId: roomId, roomId
     };
     let settled = false;
+    let connectTimer = 0;
+
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      if (connectTimer) { clearTimeout(connectTimer); connectTimer = 0; }
+      // Si on a déjà inscrit la room dans la map, on la nettoie sans
+      // émettre le toast "hôte parti" (room.leaving = true via leaveRoom).
+      if (rooms.get(windowId) === room) leaveRoom(windowId);
+      try { peer.destroy(); } catch (_) {}
+      reject(new Error(describePeerError(err)));
+    };
 
     peer.on('open', (id) => {
       room.selfPeerId = id;
       rooms.set(windowId, room);
-      sendToContent(windowId, { type: 'SET_ROLE', isHost: false });
       const conn = peer.connect(roomId, { reliable: true });
       setupGuestConnection(room, conn);
-      settled = true;
-      resolve({ windowId });
+
+      // On ne résout que quand le DataChannel est réellement ouvert.
+      // Évite que le popup transitionne en "en salle" avant qu'on ait la
+      // confirmation que l'hôte est joignable (cf. T022/T026).
+      conn.on('open', () => {
+        if (settled) return;
+        settled = true;
+        sendToContent(windowId, { type: 'SET_ROLE', isHost: false });
+        resolve({ windowId });
+      });
+
+      // Garde-fou : si rien n'ouvre dans 10s, on échoue avec une erreur claire.
+      connectTimer = setTimeout(() => {
+        fail({ type: 'peer-unavailable' });
+      }, 10000);
     });
 
     peer.on('error', (err) => {
       console.error('[cinemate] peer error', err);
       if (!settled) {
-        // Échec avant que le peer soit prêt (ex: réseau, serveur down)
-        settled = true;
-        try { peer.destroy(); } catch (_) {}
-        reject(new Error(describePeerError(err)));
+        // Échec avant que la connexion soit prête (réseau, serveur down,
+        // ID inexistant détecté tôt par PeerJS, etc.)
+        fail(err);
       } else if (err && err.type === 'peer-unavailable') {
-        // L'ID de salle n'existe pas (ou plus) → on dissout proprement
+        // Cas tardif : l'hôte disparaît après l'établissement de la salle.
         leaveRoomAndNotify(windowId, describePeerError(err));
       }
     });
@@ -426,6 +452,9 @@ function joinRoom(windowId, pseudo, roomId) {
 function leaveRoom(windowId) {
   const room = rooms.get(windowId);
   if (!room) return;
+  // Marqueur consulté par les handlers conn.on('close') pour ne pas
+  // émettre le toast "hôte parti" alors que c'est nous qui partons.
+  room.leaving = true;
   stopHostHeartbeat(room);
   for (const conn of room.connections.values()) {
     try { conn.close(); } catch (_) {}
@@ -562,10 +591,17 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
   }
 });
 
-// Cleanup on tab close
+// Cleanup on tab close — couvre aussi la fermeture de la fenêtre entière
+// (chaque tab fermé déclenche un onRemoved). Si une salle était attachée à
+// ce tab, on la quitte : pour l'hôte ça dissout la salle pour les invités via
+// la fermeture des DataChannels ; pour l'invité ça libère la connexion côté
+// hôte qui propage un MEMBERS_UPDATE aux autres.
 browser.tabs.onRemoved.addListener((tabId) => {
   for (const [windowId, id] of videoTabs) {
-    if (id === tabId) videoTabs.delete(windowId);
+    if (id === tabId) {
+      videoTabs.delete(windowId);
+      if (rooms.has(windowId)) leaveRoom(windowId);
+    }
   }
 });
 

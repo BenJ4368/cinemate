@@ -34,6 +34,12 @@ module.exports = (env = {}) => {
     devtool: 'cheap-source-map',
     optimization: {
       minimize: false
+    },
+    // PeerJS pèse ~340 KiB une fois bundlé : c'est attendu pour une
+    // extension qui embarque une stack WebRTC. On désactive les hints
+    // pour ne pas polluer la sortie avec des warnings non actionnables.
+    performance: {
+      hints: false
     }
   };
 };
