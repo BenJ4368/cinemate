@@ -124,11 +124,22 @@ function applySync(msg) {
   nativeSetCurrentTime(video, msg.currentTime);
   if (msg.paused) {
     nativePause(video);
+    setTimeout(() => { isSyncing = false; }, 100);
   } else {
     const p = nativePlay(video);
     if (p && typeof p.then === 'function') p.catch(() => {});
+    // Re-baseline lastSync.ts au vrai démarrage de la lecture (après warmup
+    // décodeur). Sinon enforceGuestState/CHECK_DRIFT sur-projettent pendant
+    // que video.currentTime reste figé → saut en avant visible.
+    const onPlaying = () => {
+      video.removeEventListener('playing', onPlaying);
+      if (lastSync) lastSync.ts = Date.now();
+    };
+    video.addEventListener('playing', onPlaying);
+    // Fenêtre isSyncing étendue : couvre le warmup pour ignorer les events
+    // parasites (seeked interne YouTube, play events successifs).
+    setTimeout(() => { isSyncing = false; }, 1500);
   }
-  setTimeout(() => { isSyncing = false; }, 100);
 }
 
 // ----- Banner UI -----
@@ -380,6 +391,10 @@ browser.runtime.onMessage.addListener((message) => {
   } else if (message.type === 'CHECK_DRIFT') {
     // Heartbeat invité : reposition uniquement si drift > 1s ou état play/pause incohérent
     if (!video || isHost) return;
+    // Skip pendant le warmup d'une applySync récente : la video n'est pas
+    // encore en lecture, comparer son currentTime à la projection hôte
+    // déclencherait un faux saut correctif.
+    if (isSyncing) return;
     lastSync = { currentTime: message.currentTime, paused: message.paused, ts: Date.now() };
     const drift = Math.abs(video.currentTime - message.currentTime);
     const playMismatch = video.paused !== message.paused;

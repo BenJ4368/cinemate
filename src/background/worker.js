@@ -158,6 +158,7 @@ function startHostHeartbeat(room) {
     if (!room.isHost) return;
     const state = hostStates.get(room.windowId);
     if (!state) return;
+    console.log('[cinemate] heartbeat', state)
     broadcast(room, {
       type: 'HEARTBEAT',
       url: state.url,
