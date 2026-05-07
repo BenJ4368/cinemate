@@ -199,6 +199,15 @@ async function followHostUrl(room, msg) {
 
   if (tab.url !== msg.url) {
     try {
+      // Redirection en cours → on n'est plus prêt tant que la nouvelle page
+      // n'a pas chargé sa vidéo (canplay ré-émettra SET_READY=true).
+      if (!room.isHost) {
+        const selfMember = room.members.get(room.selfPeerId);
+        if (selfMember && selfMember.ready) selfMember.ready = false;
+        for (const c of room.connections.values()) {
+          if (c.open) c.send(JSON.stringify({ type: 'GUEST_READY', ready: false }));
+        }
+      }
       await browser.tabs.update(target, { url: msg.url });
       // Wait for the new page's content script before applying sync
       setTimeout(() => {
@@ -257,6 +266,14 @@ function setupHostConnection(room, conn) {
         currentTime: state.currentTime,
         paused: state.paused,
         recordedAt: state.recordedAt
+      }));
+    }
+    // État pubs courant : nécessaire pour que l'arrivant voie qui est déjà
+    // en pub. Sinon il rate les AD_STATES_UPDATE émis avant son join.
+    if (room.adStates && room.adStates.size > 0) {
+      conn.send(JSON.stringify({
+        type: 'AD_STATES_UPDATE',
+        peerIds: Array.from(room.adStates.keys())
       }));
     }
   });
@@ -541,12 +558,23 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
       videoTabs.set(windowId, tabId);
 
       if (room && room.isHost) {
+        const prev = hostStates.get(windowId);
+        const urlChanged = !!(prev && prev.url && prev.url !== message.url);
         hostStates.set(windowId, {
           url: message.url,
           currentTime: message.currentTime,
           paused: message.paused,
           recordedAt: Date.now()
         });
+        // Nouvelle vidéo côté hôte → tous les invités redeviennent "pas prêt"
+        // tant qu'ils n'ont pas chargé la nouvelle vidéo.
+        if (urlChanged) {
+          let any = false;
+          for (const member of room.members.values()) {
+            if (!member.isHost && member.ready) { member.ready = false; any = true; }
+          }
+          if (any) notifyMembersUpdate(room);
+        }
       }
       if (room) {
         return {
