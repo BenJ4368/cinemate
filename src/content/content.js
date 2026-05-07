@@ -6,6 +6,12 @@ let inRoom = false;
 let isSyncing = false;
 let lastSync = null; // { currentTime, paused, ts }
 let banner = null;
+let currentMembers = []; // [{ peerId, pseudo, isHost, ready }]
+let selfPeerId = null;
+
+function allMembersReady() {
+  return currentMembers.length > 0 && currentMembers.every(m => m.ready);
+}
 
 const NATIVE_PLAY = HTMLMediaElement.prototype.play;
 const NATIVE_PAUSE = HTMLMediaElement.prototype.pause;
@@ -61,22 +67,8 @@ function registerVideo(action) {
   }).catch(() => {});
 }
 
-let lastEventAction = null;
-let lastEventTs = 0;
-
 function sendVideoEvent(action) {
   if (!video || !inRoom || !isHost || isSyncing) return;
-  const now = Date.now();
-  // Squash : YouTube/MSE peut émettre 'seeked' juste après 'play'/'pause'
-  // (snap keyframe, ajustement buffer). Ce seek interne, broadcast tel quel,
-  // fait re-seek l'invité sur une position légèrement différente → saut visible.
-  if (action === 'seek'
-      && (lastEventAction === 'play' || lastEventAction === 'pause')
-      && now - lastEventTs < 500) {
-    return;
-  }
-  lastEventAction = action;
-  lastEventTs = now;
   browser.runtime.sendMessage({
     type: 'VIDEO_EVENT',
     action,
@@ -111,8 +103,21 @@ function enforceGuestState() {
 function attachVideoListeners(v) {
   v.addEventListener('play', () => {
     if (isSyncing) return;
-    if (isHost) sendVideoEvent('play');
-    else enforceGuestState();
+    if (isHost) {
+      // Gate : tant que tout le monde n'est pas prêt, l'hôte ne peut pas
+      // démarrer la lecture. Pendant une pub locale, on laisse le player
+      // continuer (le gate pub gère ce cas séparément).
+      if (!localInAd && !allMembersReady()) {
+        isSyncing = true;
+        nativePause(video);
+        setTimeout(() => { isSyncing = false; }, 100);
+        showToast('En attente que tous les invités soient prêts');
+        return;
+      }
+      sendVideoEvent('play');
+    } else {
+      enforceGuestState();
+    }
   });
   v.addEventListener('pause', () => {
     if (isSyncing) return;
@@ -138,29 +143,11 @@ function applySync(msg) {
   nativeSetCurrentTime(video, msg.currentTime);
   if (msg.paused) {
     nativePause(video);
-    setTimeout(() => { isSyncing = false; }, 100);
   } else {
     const p = nativePlay(video);
     if (p && typeof p.then === 'function') p.catch(() => {});
-    // Re-baseline lastSync.ts au vrai démarrage de la lecture (après warmup
-    // décodeur). Sinon enforceGuestState/CHECK_DRIFT sur-projettent pendant
-    // que video.currentTime reste figé → saut en avant visible.
-    const onPlaying = () => {
-      video.removeEventListener('playing', onPlaying);
-      // Re-aligne lastSync sur l'état réel du player au moment où la lecture
-      // démarre vraiment : video.currentTime peut avoir été déplacé par le
-      // player (snap keyframe YouTube) pendant le warmup, sinon enforceGuestState
-      // sur-estimerait l'écart et provoquerait un saut arrière.
-      if (lastSync) {
-        lastSync.ts = Date.now();
-        lastSync.currentTime = video.currentTime;
-      }
-    };
-    video.addEventListener('playing', onPlaying);
-    // Fenêtre isSyncing étendue : couvre le warmup pour ignorer les events
-    // parasites (seeked interne YouTube, play events successifs).
-    setTimeout(() => { isSyncing = false; }, 1500);
   }
+  setTimeout(() => { isSyncing = false; }, 100);
 }
 
 // ----- Banner UI -----
@@ -171,20 +158,23 @@ function ensureBanner() {
   banner.id = 'cinemate-banner';
   banner.setAttribute('role', 'status');
   banner.setAttribute('aria-label', 'Salle Cinemate');
+  // Thème cinéma classique : velours rouge profond + or, cohérent avec le popup.
   banner.style.cssText = [
     'position:fixed',
     'bottom:16px',
     'right:16px',
     'z-index:2147483647',
-    'background:linear-gradient(135deg,#6e3bff,#ff3ba0)',
-    'color:#fff',
-    'font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif',
-    'font-size:13px',
-    'padding:10px 14px',
-    'border-radius:10px',
-    'box-shadow:0 6px 20px rgba(0,0,0,.35)',
-    'pointer-events:none',
-    'max-width:360px',
+    'background:linear-gradient(135deg,#4a0608 0%,#2d0405 100%)',
+    'color:#fff5d6',
+    'font-family:Georgia,"Times New Roman",serif',
+    'font-size:12px',
+    'padding:10px 12px 12px',
+    'border-radius:8px',
+    'border:1px solid rgba(245,197,66,0.45)',
+    'box-shadow:0 6px 20px rgba(0,0,0,.55),inset 0 0 14px rgba(0,0,0,0.4)',
+    'min-width:200px',
+    'max-width:280px',
+    'pointer-events:auto',
     'line-height:1.4'
   ].join(';');
   document.body.appendChild(banner);
@@ -260,6 +250,18 @@ function showToast(text) {
   append();
 }
 
+function memberInAd(peerId) {
+  if (peerId === selfPeerId) return localInAd;
+  return othersInAd.some(p => p.peerId === peerId);
+}
+
+function statusIcon(member) {
+  if (memberInAd(member.peerId)) return { icon: '⏸', label: 'En pub', color: '#ff9b3a' };
+  if (member.isHost) return { icon: '★', label: 'Hôte', color: '#f5c542' };
+  if (member.ready) return { icon: '✓', label: 'Prêt', color: '#7ed957' };
+  return { icon: '⌛', label: 'Pas prêt', color: '#d4a857' };
+}
+
 function renderBanner(members) {
   if (!members || members.length === 0) {
     if (banner && banner.parentNode) banner.parentNode.removeChild(banner);
@@ -267,15 +269,210 @@ function renderBanner(members) {
     return;
   }
   const el = ensureBanner();
+  el.textContent = '';
+
+  // En-tête type marquee
+  const header = document.createElement('div');
+  header.style.cssText = [
+    'font-weight:900',
+    'letter-spacing:3px',
+    'text-transform:uppercase',
+    'color:#f5c542',
+    'text-align:center',
+    'font-size:11px',
+    'border-bottom:1px dashed rgba(245,197,66,0.35)',
+    'padding-bottom:6px',
+    'margin-bottom:8px',
+    'text-shadow:0 0 4px rgba(245,197,66,0.4)'
+  ].join(';');
+  header.textContent = '★ CINEMATE ★';
+  el.appendChild(header);
+
   const sorted = [...members].sort((a, b) => {
     if (a.isHost && !b.isHost) return -1;
     if (!a.isHost && b.isHost) return 1;
     return a.pseudo.localeCompare(b.pseudo);
   });
-  const visible = sorted.slice(0, 3).map(m => m.isHost ? `★ ${m.pseudo}` : m.pseudo);
-  const extra = sorted.length - visible.length;
-  const tail = extra > 0 ? ` +${extra} autre${extra > 1 ? 's' : ''}` : '';
-  el.textContent = `Cinemate — ${visible.join(', ')}${tail}`;
+
+  for (const m of sorted) {
+    const isSelf = m.peerId === selfPeerId;
+    const row = document.createElement('div');
+    row.style.cssText = [
+      'display:flex',
+      'align-items:center',
+      'gap:8px',
+      'padding:4px 2px',
+      'border-bottom:1px dashed rgba(245,197,66,0.12)'
+    ].join(';');
+
+    const { icon, label, color } = statusIcon(m);
+    const statusEl = document.createElement('span');
+    statusEl.style.cssText = `min-width:18px;text-align:center;font-size:14px;color:${color};`;
+    statusEl.textContent = icon;
+    statusEl.title = label;
+
+    const nameEl = document.createElement('span');
+    nameEl.style.cssText = 'flex:1;color:#fff5d6;' + (m.isHost ? 'font-weight:700;color:#f5c542;' : '');
+    nameEl.textContent = m.pseudo + (isSelf ? ' (toi)' : '');
+
+    row.appendChild(statusEl);
+    row.appendChild(nameEl);
+
+    // Bouton "Je suis prêt" : visible uniquement pour soi-même quand on est
+    // invité et pas encore prêt.
+    if (isSelf && !m.isHost && !m.ready) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.textContent = 'Prêt';
+      btn.style.cssText = [
+        'pointer-events:auto',
+        'cursor:pointer',
+        'background:linear-gradient(180deg,#f5c542 0%,#c9941a 100%)',
+        'color:#3a0608',
+        'border:1px solid #b8860b',
+        'border-radius:4px',
+        'padding:3px 10px',
+        'font-family:Georgia,serif',
+        'font-size:11px',
+        'font-weight:700',
+        'letter-spacing:0.5px',
+        'text-transform:uppercase',
+        'box-shadow:0 1px 3px rgba(0,0,0,0.3),inset 0 1px 0 rgba(255,255,255,0.4)'
+      ].join(';');
+      btn.addEventListener('click', () => {
+        browser.runtime.sendMessage({ type: 'SET_READY', ready: true }).catch(() => {});
+      });
+      row.appendChild(btn);
+    }
+
+    el.appendChild(row);
+  }
+
+  // Hint si l'hôte est bloqué par le gate "pas prêt"
+  if (isHost && !allMembersReady()) {
+    const hint = document.createElement('div');
+    hint.style.cssText = [
+      'margin-top:8px',
+      'padding-top:6px',
+      'border-top:1px dashed rgba(245,197,66,0.25)',
+      'color:#d4a857',
+      'font-size:10px',
+      'font-style:italic',
+      'text-align:center'
+    ].join(';');
+    hint.textContent = 'Lecture bloquée — invités pas tous prêts';
+    el.appendChild(hint);
+  }
+}
+
+// ----- Détection pub + gate (option B : tous en pause si quelqu'un a une pub) -----
+
+let localInAd = false;
+let othersInAd = []; // [{ peerId, pseudo }]
+let pausedByAdGate = false;
+let adBanner = null;
+let adObserver = null;
+
+function detectInAd() {
+  // YouTube : la classe `.ad-showing` est posée sur #movie_player pendant
+  // la diffusion d'une publicité. Autres plateformes : pas de détection.
+  const player = document.querySelector('#movie_player');
+  return !!(player && player.classList.contains('ad-showing'));
+}
+
+function publishAdState() {
+  const inAd = detectInAd();
+  if (inAd === localInAd) return;
+  const wasInAd = localInAd;
+  localInAd = inAd;
+  if (inRoom) {
+    browser.runtime.sendMessage({ type: 'AD_STATE', inAd }).catch(() => {});
+  }
+  // Pub locale terminée → resync immédiat sans attendre le heartbeat.
+  if (wasInAd && !inAd && inRoom && !isHost) {
+    browser.runtime.sendMessage({ type: 'REQUEST_SYNC' }).catch(() => {});
+  }
+  applyAdGate();
+}
+
+function startAdObserver() {
+  if (adObserver) return;
+  const player = document.querySelector('#movie_player');
+  if (!player) {
+    setTimeout(startAdObserver, 1000);
+    return;
+  }
+  adObserver = new MutationObserver(publishAdState);
+  adObserver.observe(player, { attributes: true, attributeFilter: ['class'] });
+  publishAdState();
+}
+
+function stopAdObserver() {
+  if (adObserver) { adObserver.disconnect(); adObserver = null; }
+}
+
+function applyAdGate() {
+  const shouldGate = othersInAd.length > 0 && !localInAd;
+  if (shouldGate) {
+    if (video && !video.paused) {
+      isSyncing = true;
+      nativePause(video);
+      pausedByAdGate = true;
+      setTimeout(() => { isSyncing = false; }, 100);
+    }
+  } else if (pausedByAdGate && !localInAd) {
+    // Gate libéré → reprise auto. L'hôte se réaligne via son heartbeat ;
+    // les invités attendront le prochain APPLY_SYNC/CHECK_DRIFT.
+    if (video && video.paused) {
+      isSyncing = true;
+      const p = nativePlay(video);
+      if (p && typeof p.then === 'function') p.catch(() => {});
+      setTimeout(() => { isSyncing = false; }, 100);
+    }
+    pausedByAdGate = false;
+  }
+  renderAdBanner();
+  // Statuts "en pub" dans la liste membres → re-render à chaque changement.
+  if (currentMembers.length) renderBanner(currentMembers);
+}
+
+function renderAdBanner() {
+  if (othersInAd.length === 0) {
+    if (adBanner && adBanner.parentNode) adBanner.parentNode.removeChild(adBanner);
+    adBanner = null;
+    return;
+  }
+  const player = document.querySelector('#movie_player') || document.body;
+  if (!adBanner || !document.body.contains(adBanner)) {
+    adBanner = document.createElement('div');
+    adBanner.id = 'cinemate-ad-banner';
+    adBanner.setAttribute('role', 'status');
+    adBanner.style.cssText = [
+      'position:absolute',
+      'top:12px',
+      'right:12px',
+      'z-index:2147483647',
+      'background:linear-gradient(180deg,#f5c542 0%,#c9941a 100%)',
+      'color:#3a0608',
+      'font-family:Georgia,serif',
+      'font-size:13px',
+      'font-weight:700',
+      'letter-spacing:0.3px',
+      'padding:8px 14px',
+      'border-radius:6px',
+      'border:1px solid #b8860b',
+      'box-shadow:0 4px 12px rgba(0,0,0,0.4),inset 0 1px 0 rgba(255,255,255,0.4)',
+      'pointer-events:none',
+      'max-width:280px',
+      'word-wrap:break-word'
+    ].join(';');
+  }
+  if (adBanner.parentNode !== player) player.appendChild(adBanner);
+  if (player !== document.body && getComputedStyle(player).position === 'static') {
+    player.style.position = 'relative';
+  }
+  const names = othersInAd.map(p => p.pseudo).join(', ');
+  adBanner.textContent = `⏸ Pub en cours chez ${names}`;
 }
 
 // ----- Boot -----
@@ -290,6 +487,7 @@ function init() {
     // de réagir à chaque mutation DOM (très coûteux sur YouTube/SPA).
     // Il sera réarmé sur changement d'URL.
     stopObserver();
+    startAdObserver();
   }
 }
 
@@ -388,6 +586,9 @@ setInterval(() => {
     video = null;
     lastSync = null;
     // Nouvelle page → on réarme l'observer pour retrouver la nouvelle <video>
+    stopAdObserver();
+    localInAd = false;
+    pausedByAdGate = false;
     startObserver();
     init();
     if (inRoom && isHost) {
@@ -408,14 +609,15 @@ setInterval(() => {
 
 browser.runtime.onMessage.addListener((message) => {
   if (message.type === 'APPLY_SYNC') {
+    // Tant qu'une pub tourne (ici ou ailleurs), on ne touche pas au player :
+    // soit l'ad joue localement, soit on est figé en attendant que les autres
+    // sortent de pub. Le resync vient ensuite via REQUEST_SYNC / heartbeat.
+    if (localInAd || othersInAd.length > 0) return;
     applySync(message);
   } else if (message.type === 'CHECK_DRIFT') {
     // Heartbeat invité : reposition uniquement si drift > 1s ou état play/pause incohérent
     if (!video || isHost) return;
-    // Skip pendant le warmup d'une applySync récente : la video n'est pas
-    // encore en lecture, comparer son currentTime à la projection hôte
-    // déclencherait un faux saut correctif.
-    if (isSyncing) return;
+    if (localInAd || othersInAd.length > 0) return;
     lastSync = { currentTime: message.currentTime, paused: message.paused, ts: Date.now() };
     const drift = Math.abs(video.currentTime - message.currentTime);
     const playMismatch = video.paused !== message.paused;
@@ -427,12 +629,36 @@ browser.runtime.onMessage.addListener((message) => {
     if (message.leftRoom) {
       inRoom = false;
       lastSync = null;
+      othersInAd = [];
+      pausedByAdGate = false;
+      currentMembers = [];
+      selfPeerId = null;
       renderBanner([]);
+      renderAdBanner();
     } else {
       inRoom = true;
+      // Création/rejointure : on fige la lecture au timecode courant.
+      // L'hôte ne pourra play qu'après que tout le monde soit prêt.
+      if (video && !video.paused) {
+        isSyncing = true;
+        nativePause(video);
+        setTimeout(() => { isSyncing = false; }, 100);
+      }
     }
   } else if (message.type === 'ROOM_MEMBERS') {
-    renderBanner(message.members || []);
+    currentMembers = message.members || [];
+    if (message.selfPeerId) selfPeerId = message.selfPeerId;
+    renderBanner(currentMembers);
+    // Hôte : si quelqu'un n'est pas prêt et qu'on est en lecture, on coupe.
+    if (isHost && video && !video.paused && !localInAd && !allMembersReady()) {
+      isSyncing = true;
+      nativePause(video);
+      setTimeout(() => { isSyncing = false; }, 100);
+      showToast('En attente que tous les invités soient prêts');
+    }
+  } else if (message.type === 'OTHERS_IN_AD') {
+    othersInAd = message.peers || [];
+    applyAdGate();
   } else if (message.type === 'SHOW_TOAST') {
     showToast(message.message || '');
   } else if (message.type === 'PING') {

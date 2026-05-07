@@ -134,7 +134,11 @@ async function notifyMembersUpdate(room, currentMembers) {
   const diff = diffMembers(room.lastMembers, current, room.selfPeerId);
   room.lastMembers = current;
 
-  await sendToContent(room.windowId, { type: 'ROOM_MEMBERS', members: current });
+  await sendToContent(room.windowId, {
+    type: 'ROOM_MEMBERS',
+    members: current,
+    selfPeerId: room.selfPeerId
+  });
   if (!isInitial) emitMemberToasts(room.windowId, diff, room.selfPeerId);
   sendPopupUpdate();
 
@@ -158,18 +162,12 @@ function startHostHeartbeat(room) {
     if (!room.isHost) return;
     const state = hostStates.get(room.windowId);
     if (!state) return;
-    // Projection côté hôte (horloge locale) avant broadcast : on évite que
-    // l'invité fasse Date.now() - msg.recordedAt avec deux horloges
-    // distinctes (skew NTP + RTT) → seek parasite avant lecture.
-    const projectedCurrentTime = state.paused
-      ? state.currentTime
-      : state.currentTime + (Date.now() - state.recordedAt) / 1000;
-    console.log('[cinemate] heartbeat', state);
     broadcast(room, {
       type: 'HEARTBEAT',
       url: state.url,
-      currentTime: projectedCurrentTime,
-      paused: state.paused
+      currentTime: state.currentTime,
+      paused: state.paused,
+      recordedAt: state.recordedAt
     });
   }, HEARTBEAT_MS);
 }
@@ -202,21 +200,16 @@ async function followHostUrl(room, msg) {
   if (tab.url !== msg.url) {
     try {
       await browser.tabs.update(target, { url: msg.url });
-      // Wait for the new page's content script before applying sync.
-      // msg.currentTime déjà projeté côté hôte. On ajoute le délai d'attente
-      // pour rattraper la lecture qui a continué pendant le chargement.
-      const REDIRECT_WAIT_MS = 2500;
+      // Wait for the new page's content script before applying sync
       setTimeout(() => {
-        const projected = msg.paused
-          ? msg.currentTime
-          : msg.currentTime + REDIRECT_WAIT_MS / 1000;
+        const projected = msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000);
         sendToContent(room.windowId, {
           type: 'APPLY_SYNC',
           action: 'seek',
           currentTime: projected,
           paused: msg.paused
         });
-      }, REDIRECT_WAIT_MS);
+      }, 2500);
       return true;
     } catch (e) {
       console.warn('[cinemate] could not redirect tab', e);
@@ -230,6 +223,26 @@ async function leaveRoomAndNotify(windowId, message) {
   // Le tab est probablement en train de charger une nouvelle page,
   // sendToContent retente jusqu'à 3 fois — on attrape le nouveau content script.
   sendToContent(windowId, { type: 'SHOW_TOAST', message });
+}
+
+// Pubs : chaque membre signale son ad state. L'hôte agrège dans room.adStates
+// et rebroadcast la liste à tous. Tant qu'au moins un membre est en pub, les
+// autres se mettent en pause locale (gérée côté content script).
+function notifyAdStates(room) {
+  if (!room.adStates) room.adStates = new Map();
+  const peers = [];
+  for (const peerId of room.adStates.keys()) {
+    if (peerId === room.selfPeerId) continue;
+    const member = room.members.get(peerId);
+    if (member) peers.push({ peerId, pseudo: member.pseudo });
+  }
+  sendToContent(room.windowId, { type: 'OTHERS_IN_AD', peers });
+}
+
+function broadcastAdStates(room) {
+  if (!room.adStates) room.adStates = new Map();
+  const peerIds = Array.from(room.adStates.keys());
+  broadcast(room, { type: 'AD_STATES_UPDATE', peerIds });
 }
 
 function setupHostConnection(room, conn) {
@@ -254,7 +267,9 @@ function setupHostConnection(room, conn) {
 
     if (msg.type === 'HELLO') {
       const safePseudo = sanitizePseudo(msg.pseudo) || 'Anonyme';
-      room.members.set(conn.peer, { pseudo: safePseudo, isHost: false, peerId: conn.peer });
+      // Nouvel invité = pas prêt par défaut. Doit cliquer "Je suis prêt" pour
+      // débloquer la lecture côté hôte.
+      room.members.set(conn.peer, { pseudo: safePseudo, isHost: false, peerId: conn.peer, ready: false });
       notifyMembersUpdate(room);
     } else if (msg.type === 'REQUEST_SYNC') {
       const state = compensatedState(hostStates.get(room.windowId));
@@ -267,12 +282,29 @@ function setupHostConnection(room, conn) {
           recordedAt: state.recordedAt
         }));
       }
+    } else if (msg.type === 'AD_STATE') {
+      // Un invité signale son entrée/sortie de pub.
+      if (!room.adStates) room.adStates = new Map();
+      if (msg.inAd) room.adStates.set(conn.peer, true);
+      else room.adStates.delete(conn.peer);
+      broadcastAdStates(room);
+      notifyAdStates(room);
+    } else if (msg.type === 'GUEST_READY') {
+      const member = room.members.get(conn.peer);
+      if (member) {
+        member.ready = !!msg.ready;
+        notifyMembersUpdate(room);
+      }
     }
   });
 
   conn.on('close', () => {
     room.connections.delete(conn.peer);
     room.members.delete(conn.peer);
+    if (room.adStates && room.adStates.delete(conn.peer)) {
+      broadcastAdStates(room);
+      notifyAdStates(room);
+    }
     notifyMembersUpdate(room);
   });
 
@@ -292,38 +324,40 @@ function setupGuestConnection(room, conn) {
     try { msg = JSON.parse(raw); } catch (_) { return; }
 
     if (msg.type === 'INITIAL_STATE') {
-      // currentTime déjà projeté à "host now" via compensatedState côté hôte.
-      // Pas de re-projection ici (horloges non synchronisées entre machines).
       const redirected = await followHostUrl(room, msg);
       if (!redirected) {
         sendToContent(room.windowId, {
           type: 'APPLY_SYNC',
           action: 'seek',
-          currentTime: msg.currentTime,
+          currentTime: msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000),
           paused: msg.paused
         });
       }
     } else if (msg.type === 'VIDEO_EVENT') {
-      // currentTime = position hôte exacte au moment de l'event.
-      // Pas de projection cross-horloge → l'invité ne voit pas de micro-seek
-      // parasite avant lecture.
       sendToContent(room.windowId, {
         type: 'APPLY_SYNC',
         action: msg.action,
-        currentTime: msg.currentTime,
+        currentTime: msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000),
         paused: msg.paused
       });
     } else if (msg.type === 'HEARTBEAT') {
       // Suivi d'URL : si l'hôte a changé de vidéo, on redirige l'onglet invité.
       const redirected = await followHostUrl(room, msg);
       if (!redirected) {
-        // currentTime déjà projeté côté hôte avant broadcast.
+        // Sinon on demande au content script de vérifier le drift (>1s déclenche reposition).
+        const projected = msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000);
         sendToContent(room.windowId, {
           type: 'CHECK_DRIFT',
-          currentTime: msg.currentTime,
+          currentTime: projected,
           paused: msg.paused
         });
       }
+    } else if (msg.type === 'AD_STATES_UPDATE') {
+      // L'hôte rebroadcast la liste agrégée des peers en pub.
+      if (!room.adStates) room.adStates = new Map();
+      room.adStates.clear();
+      for (const peerId of msg.peerIds || []) room.adStates.set(peerId, true);
+      notifyAdStates(room);
     } else if (msg.type === 'MEMBERS_UPDATE') {
       // L'hôte est source de vérité — on synchronise notre state local.
       // On re-sanitize les pseudos par défense en profondeur (un hôte
@@ -333,7 +367,8 @@ function setupGuestConnection(room, conn) {
         .map(m => ({
           peerId: m.peerId,
           pseudo: sanitizePseudo(m.pseudo) || 'Anonyme',
-          isHost: !!m.isHost
+          isHost: !!m.isHost,
+          ready: !!m.ready
         }));
       room.members.clear();
       for (const m of sanitized) {
@@ -374,7 +409,8 @@ function createRoom(windowId, pseudo) {
       room.selfPeerId = id;
       room.hostPeerId = id;
       room.roomId = id;
-      room.members.set(id, { pseudo, isHost: true, peerId: id });
+      // L'hôte est toujours considéré prêt — il contrôle le déclenchement.
+      room.members.set(id, { pseudo, isHost: true, peerId: id, ready: true });
       rooms.set(windowId, room);
       sendToContent(windowId, { type: 'SET_ROLE', isHost: true });
       notifyMembersUpdate(room);
@@ -549,6 +585,45 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
       // Ask the host
       for (const conn of room.connections.values()) {
         if (conn.open) conn.send(JSON.stringify({ type: 'REQUEST_SYNC' }));
+      }
+      return;
+    }
+
+    case 'SET_READY': {
+      // Bouton "Je suis prêt" côté invité.
+      const windowId = sender.tab && sender.tab.windowId;
+      const room = rooms.get(windowId);
+      if (!room || room.isHost) return;
+      const ready = !!message.ready;
+      const selfMember = room.members.get(room.selfPeerId);
+      if (selfMember) selfMember.ready = ready;
+      // L'hôte est source de vérité : on le notifie, il rebroadcast à tous.
+      for (const conn of room.connections.values()) {
+        if (conn.open) conn.send(JSON.stringify({ type: 'GUEST_READY', ready }));
+      }
+      // Feedback local immédiat (n'attend pas le rebroadcast).
+      notifyMembersUpdate(room);
+      return;
+    }
+
+    case 'AD_STATE': {
+      // Le content script signale son entrée/sortie de pub.
+      const windowId = sender.tab && sender.tab.windowId;
+      const room = rooms.get(windowId);
+      if (!room) return;
+      if (!room.adStates) room.adStates = new Map();
+      const selfId = room.selfPeerId;
+      if (room.isHost) {
+        // Hôte : met à jour son propre état + rebroadcast à tous.
+        if (message.inAd) room.adStates.set(selfId, true);
+        else room.adStates.delete(selfId);
+        broadcastAdStates(room);
+        notifyAdStates(room);
+      } else {
+        // Invité : envoie à l'hôte qui agrégera et rebroadcast.
+        for (const conn of room.connections.values()) {
+          if (conn.open) conn.send(JSON.stringify({ type: 'AD_STATE', inAd: !!message.inAd }));
+        }
       }
       return;
     }
