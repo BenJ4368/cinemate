@@ -8,9 +8,28 @@ let lastSync = null; // { currentTime, paused, ts }
 let banner = null;
 let currentMembers = []; // [{ peerId, pseudo, isHost, ready }]
 let selfPeerId = null;
+let hasSentReady = false;
 
 function allMembersReady() {
   return currentMembers.length > 0 && currentMembers.every(m => m.ready);
+}
+
+let lastNotReadyToastAt = 0;
+const NOT_READY_TOAST_COOLDOWN_MS = 5000;
+function notifyNotReady() {
+  const now = Date.now();
+  if (now - lastNotReadyToastAt < NOT_READY_TOAST_COOLDOWN_MS) return;
+  lastNotReadyToastAt = now;
+  showToast('Tous les spectateurs ne sont pas prêts');
+}
+
+function maybeAutoSendReady() {
+  if (!inRoom || isHost || hasSentReady) return;
+  if (!video) return;
+  // readyState >= 3 (HAVE_FUTURE_DATA) : la vidéo peut commencer la lecture.
+  if (video.readyState < 3) return;
+  hasSentReady = true;
+  browser.runtime.sendMessage({ type: 'SET_READY', ready: true }).catch(() => {});
 }
 
 const NATIVE_PLAY = HTMLMediaElement.prototype.play;
@@ -111,7 +130,7 @@ function attachVideoListeners(v) {
         isSyncing = true;
         nativePause(video);
         setTimeout(() => { isSyncing = false; }, 100);
-        showToast('En attente que tous les invités soient prêts');
+        notifyNotReady();
         return;
       }
       sendVideoEvent('play');
@@ -134,6 +153,9 @@ function attachVideoListeners(v) {
     if (isHost) sendVideoEvent('rate');
   });
   v.addEventListener('loadedmetadata', () => registerVideo('loaded'));
+  // Auto-ready : dès que la vidéo peut jouer en continu, on signale prêt à l'hôte.
+  v.addEventListener('canplay', maybeAutoSendReady);
+  v.addEventListener('canplaythrough', maybeAutoSendReady);
 }
 
 function applySync(msg) {
@@ -256,10 +278,10 @@ function memberInAd(peerId) {
 }
 
 function statusIcon(member) {
-  if (memberInAd(member.peerId)) return { icon: '⏸', label: 'En pub', color: '#ff9b3a' };
-  if (member.isHost) return { icon: '★', label: 'Hôte', color: '#f5c542' };
-  if (member.ready) return { icon: '✓', label: 'Prêt', color: '#7ed957' };
-  return { icon: '⌛', label: 'Pas prêt', color: '#d4a857' };
+  if (memberInAd(member.peerId)) return { icon: '😴', label: 'En pub', color: '#ff9b3a' };
+  if (member.isHost) return { icon: '⭐', label: 'Hôte', color: '#f5c542' };
+  if (member.ready) return { icon: '🍿', label: 'Prêt', color: '#7ed957' };
+  return { icon: '⏳', label: 'Pas prêt', color: '#d4a857' };
 }
 
 function renderBanner(members) {
@@ -317,34 +339,6 @@ function renderBanner(members) {
 
     row.appendChild(statusEl);
     row.appendChild(nameEl);
-
-    // Bouton "Je suis prêt" : visible uniquement pour soi-même quand on est
-    // invité et pas encore prêt.
-    if (isSelf && !m.isHost && !m.ready) {
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.textContent = 'Prêt';
-      btn.style.cssText = [
-        'pointer-events:auto',
-        'cursor:pointer',
-        'background:linear-gradient(180deg,#f5c542 0%,#c9941a 100%)',
-        'color:#3a0608',
-        'border:1px solid #b8860b',
-        'border-radius:4px',
-        'padding:3px 10px',
-        'font-family:Georgia,serif',
-        'font-size:11px',
-        'font-weight:700',
-        'letter-spacing:0.5px',
-        'text-transform:uppercase',
-        'box-shadow:0 1px 3px rgba(0,0,0,0.3),inset 0 1px 0 rgba(255,255,255,0.4)'
-      ].join(';');
-      btn.addEventListener('click', () => {
-        browser.runtime.sendMessage({ type: 'SET_READY', ready: true }).catch(() => {});
-      });
-      row.appendChild(btn);
-    }
-
     el.appendChild(row);
   }
 
@@ -589,6 +583,11 @@ setInterval(() => {
     stopAdObserver();
     localInAd = false;
     pausedByAdGate = false;
+    // Nouvelle vidéo en cours de chargement → on n'est plus prêt.
+    if (inRoom && !isHost && hasSentReady) {
+      browser.runtime.sendMessage({ type: 'SET_READY', ready: false }).catch(() => {});
+    }
+    hasSentReady = false;
     startObserver();
     init();
     if (inRoom && isHost) {
@@ -633,6 +632,7 @@ browser.runtime.onMessage.addListener((message) => {
       pausedByAdGate = false;
       currentMembers = [];
       selfPeerId = null;
+      hasSentReady = false;
       renderBanner([]);
       renderAdBanner();
     } else {

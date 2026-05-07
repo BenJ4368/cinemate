@@ -651,9 +651,12 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
         const roomId = typeof message.roomId === 'string' ? message.roomId.trim() : '';
         if (!pseudo) return { ok: false, error: 'Pseudo requis.' };
         if (!roomId) return { ok: false, error: 'ID de salle requis.' };
+        // Ouvre un nouvel onglet dédié à la salle (on ne squatte pas l'onglet
+        // courant). followHostUrl naviguera ce tab vers l'URL de l'hôte dès
+        // que l'INITIAL_STATE arrivera.
         try {
-          const [tab] = await browser.tabs.query({ active: true, windowId });
-          if (tab) videoTabs.set(windowId, tab.id);
+          const newTab = await browser.tabs.create({ windowId, url: 'about:blank', active: true });
+          videoTabs.set(windowId, newTab.id);
         } catch (_) {}
         const result = await joinRoom(windowId, pseudo, roomId);
         return { ok: true, ...result };
