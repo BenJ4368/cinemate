@@ -238,7 +238,6 @@ async function leaveRoomAndNotify(windowId, message) {
 // et rebroadcast la liste à tous. Tant qu'au moins un membre est en pub, les
 // autres se mettent en pause locale (gérée côté content script).
 function notifyAdStates(room) {
-  if (!room.adStates) room.adStates = new Map();
   const peers = [];
   for (const peerId of room.adStates.keys()) {
     if (peerId === room.selfPeerId) continue;
@@ -249,7 +248,6 @@ function notifyAdStates(room) {
 }
 
 function broadcastAdStates(room) {
-  if (!room.adStates) room.adStates = new Map();
   const peerIds = Array.from(room.adStates.keys());
   broadcast(room, { type: 'AD_STATES_UPDATE', peerIds });
 }
@@ -301,7 +299,6 @@ function setupHostConnection(room, conn) {
       }
     } else if (msg.type === 'AD_STATE') {
       // Un invité signale son entrée/sortie de pub.
-      if (!room.adStates) room.adStates = new Map();
       if (msg.inAd) room.adStates.set(conn.peer, true);
       else room.adStates.delete(conn.peer);
       broadcastAdStates(room);
@@ -311,6 +308,33 @@ function setupHostConnection(room, conn) {
       if (member) {
         member.ready = !!msg.ready;
         notifyMembersUpdate(room);
+      }
+    } else if (msg.type === 'VIDEO_EVENT') {
+      // Action venant d'un invité : on l'applique côté hôte et on la relaie
+      // aux autres invités. Ça remplace la privation de contrôle invité —
+      // tout le monde peut désormais interagir avec le lecteur.
+      hostStates.set(room.windowId, {
+        url: msg.url,
+        currentTime: msg.currentTime,
+        paused: msg.paused,
+        recordedAt: Date.now()
+      });
+      sendToContent(room.windowId, {
+        type: 'APPLY_SYNC',
+        action: msg.action,
+        currentTime: msg.currentTime,
+        paused: msg.paused
+      });
+      const sender = conn.peer;
+      for (const [peerId, c] of room.connections) {
+        if (peerId === sender) continue;
+        if (c.open) c.send(JSON.stringify({
+          type: 'VIDEO_EVENT',
+          action: msg.action,
+          currentTime: msg.currentTime,
+          paused: msg.paused,
+          recordedAt: Date.now()
+        }));
       }
     }
   });
@@ -371,7 +395,6 @@ function setupGuestConnection(room, conn) {
       }
     } else if (msg.type === 'AD_STATES_UPDATE') {
       // L'hôte rebroadcast la liste agrégée des peers en pub.
-      if (!room.adStates) room.adStates = new Map();
       room.adStates.clear();
       for (const peerId of msg.peerIds || []) room.adStates.set(peerId, true);
       notifyAdStates(room);
@@ -417,7 +440,7 @@ function createRoom(windowId, pseudo) {
     const peer = new Peer();
     const room = {
       windowId, pseudo, isHost: true,
-      peer, connections: new Map(), members: new Map(),
+      peer, connections: new Map(), members: new Map(), adStates: new Map(),
       selfPeerId: null, hostPeerId: null, roomId: null
     };
     let settled = false;
@@ -460,7 +483,7 @@ function joinRoom(windowId, pseudo, roomId) {
     const peer = new Peer();
     const room = {
       windowId, pseudo, isHost: false,
-      peer, connections: new Map(), members: new Map(),
+      peer, connections: new Map(), members: new Map(), adStates: new Map(),
       selfPeerId: null, hostPeerId: roomId, roomId
     };
     let settled = false;
@@ -589,20 +612,34 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
     case 'VIDEO_EVENT': {
       const windowId = sender.tab && sender.tab.windowId;
       const room = rooms.get(windowId);
-      if (!room || !room.isHost) return;
-      hostStates.set(windowId, {
-        url: message.url,
-        currentTime: message.currentTime,
-        paused: message.paused,
-        recordedAt: Date.now()
-      });
-      broadcast(room, {
-        type: 'VIDEO_EVENT',
-        action: message.action,
-        currentTime: message.currentTime,
-        paused: message.paused,
-        recordedAt: Date.now()
-      });
+      if (!room) return;
+      if (room.isHost) {
+        hostStates.set(windowId, {
+          url: message.url,
+          currentTime: message.currentTime,
+          paused: message.paused,
+          recordedAt: Date.now()
+        });
+        broadcast(room, {
+          type: 'VIDEO_EVENT',
+          action: message.action,
+          currentTime: message.currentTime,
+          paused: message.paused,
+          recordedAt: Date.now()
+        });
+      } else {
+        // Invité : forward à l'hôte qui appliquera localement et relaiera
+        // aux autres invités.
+        for (const conn of room.connections.values()) {
+          if (conn.open) conn.send(JSON.stringify({
+            type: 'VIDEO_EVENT',
+            action: message.action,
+            url: message.url,
+            currentTime: message.currentTime,
+            paused: message.paused
+          }));
+        }
+      }
       return;
     }
 
@@ -639,7 +676,6 @@ browser.runtime.onMessage.addListener(async (message, sender) => {
       const windowId = sender.tab && sender.tab.windowId;
       const room = rooms.get(windowId);
       if (!room) return;
-      if (!room.adStates) room.adStates = new Map();
       const selfId = room.selfPeerId;
       if (room.isHost) {
         // Hôte : met à jour son propre état + rebroadcast à tous.

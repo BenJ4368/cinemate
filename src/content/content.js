@@ -4,7 +4,6 @@ let video = null;
 let isHost = false;
 let inRoom = false;
 let isSyncing = false;
-let lastSync = null; // { currentTime, paused, ts }
 let banner = null;
 let currentMembers = []; // [{ peerId, pseudo, isHost, ready }]
 let selfPeerId = null;
@@ -68,7 +67,7 @@ function findVideo() {
   return best || (vids.length ? vids[0] : null);
 }
 
-function registerVideo(action) {
+function registerVideo() {
   if (!video) return;
   browser.runtime.sendMessage({
     type: 'REGISTER_VIDEO_TAB',
@@ -87,7 +86,7 @@ function registerVideo(action) {
 }
 
 function sendVideoEvent(action) {
-  if (!video || !inRoom || !isHost || isSyncing) return;
+  if (!video || !inRoom || isSyncing) return;
   browser.runtime.sendMessage({
     type: 'VIDEO_EVENT',
     action,
@@ -97,62 +96,41 @@ function sendVideoEvent(action) {
   }).catch(() => {});
 }
 
-function enforceGuestState() {
-  if (!video || !lastSync || isHost) return;
-  const expected = lastSync.paused
-    ? lastSync.currentTime
-    : lastSync.currentTime + (Date.now() - lastSync.ts) / 1000;
-
-  if (Math.abs(video.currentTime - expected) > 0.5) {
-    isSyncing = true;
-    nativeSetCurrentTime(video, expected);
-    setTimeout(() => { isSyncing = false; }, 50);
-  }
-  if (lastSync.paused && !video.paused) {
-    isSyncing = true;
-    nativePause(video);
-    setTimeout(() => { isSyncing = false; }, 50);
-  } else if (!lastSync.paused && video.paused) {
-    isSyncing = true;
-    nativePlay(video);
-    setTimeout(() => { isSyncing = false; }, 50);
-  }
-}
-
 function attachVideoListeners(v) {
   v.addEventListener('play', () => {
     if (isSyncing) return;
-    if (isHost) {
-      // Gate : tant que tout le monde n'est pas prêt, l'hôte ne peut pas
-      // démarrer la lecture. Pendant une pub locale, on laisse le player
-      // continuer (le gate pub gère ce cas séparément).
-      if (!localInAd && !allMembersReady()) {
-        isSyncing = true;
-        nativePause(video);
-        setTimeout(() => { isSyncing = false; }, 100);
-        notifyNotReady();
-        return;
-      }
-      sendVideoEvent('play');
-    } else {
-      enforceGuestState();
+    // Gate pub : si quelqu'un est en pub (et pas soi), on bloque la lecture.
+    if (othersInAd.length > 0 && !localInAd) {
+      isSyncing = true;
+      nativePause(video);
+      setTimeout(() => { isSyncing = false; }, 100);
+      return;
     }
+    // Gate ready : tant que tout le monde n'est pas prêt, on ne peut pas
+    // démarrer la lecture. Pendant une pub locale, on laisse le player
+    // continuer (le gate pub gère ce cas séparément).
+    if (!localInAd && !allMembersReady()) {
+      isSyncing = true;
+      nativePause(video);
+      setTimeout(() => { isSyncing = false; }, 100);
+      notifyNotReady();
+      return;
+    }
+    sendVideoEvent('play');
   });
   v.addEventListener('pause', () => {
     if (isSyncing) return;
-    if (isHost) sendVideoEvent('pause');
-    else enforceGuestState();
+    sendVideoEvent('pause');
   });
   v.addEventListener('seeked', () => {
     if (isSyncing) return;
-    if (isHost) sendVideoEvent('seek');
-    else enforceGuestState();
+    sendVideoEvent('seek');
   });
   v.addEventListener('ratechange', () => {
     if (isSyncing) return;
-    if (isHost) sendVideoEvent('rate');
+    sendVideoEvent('rate');
   });
-  v.addEventListener('loadedmetadata', () => registerVideo('loaded'));
+  v.addEventListener('loadedmetadata', () => registerVideo());
   // Auto-ready : dès que la vidéo peut jouer en continu, on signale prêt à l'hôte.
   v.addEventListener('canplay', maybeAutoSendReady);
   v.addEventListener('canplaythrough', maybeAutoSendReady);
@@ -161,7 +139,6 @@ function attachVideoListeners(v) {
 function applySync(msg) {
   if (!video) return;
   isSyncing = true;
-  lastSync = { currentTime: msg.currentTime, paused: msg.paused, ts: Date.now() };
   nativeSetCurrentTime(video, msg.currentTime);
   if (msg.paused) {
     nativePause(video);
@@ -342,8 +319,8 @@ function renderBanner(members) {
     el.appendChild(row);
   }
 
-  // Hint si l'hôte est bloqué par le gate "pas prêt"
-  if (isHost && !allMembersReady()) {
+  // Hint quand le gate "pas prêt" est actif (s'applique à tout le monde).
+  if (!allMembersReady()) {
     const hint = document.createElement('div');
     hint.style.cssText = [
       'margin-top:8px',
@@ -354,7 +331,7 @@ function renderBanner(members) {
       'font-style:italic',
       'text-align:center'
     ].join(';');
-    hint.textContent = 'Lecture bloquée — invités pas tous prêts';
+    hint.textContent = 'Lecture bloquée — pas tous prêts';
     el.appendChild(hint);
   }
 }
@@ -476,7 +453,7 @@ function init() {
   if (v && v !== video) {
     video = v;
     attachVideoListeners(video);
-    registerVideo('detected');
+    registerVideo();
     // On a trouvé une vidéo stable → on stoppe l'observer pour éviter
     // de réagir à chaque mutation DOM (très coûteux sur YouTube/SPA).
     // Il sera réarmé sur changement d'URL.
@@ -516,48 +493,7 @@ startObserver();
 window.addEventListener('load', init);
 init();
 
-// ----- Blocker clavier pour l'invité -----
-// L'hôte garde le contrôle exclusif. Quand l'invité appuie sur les raccourcis
-// vidéo classiques (espace, k, flèches…), on les bloque AVANT le player pour
-// éviter le flicker visible (sinon enforceGuestState revert ~1s plus tard).
-
-const BLOCKED_KEYS = new Set([
-  ' ', 'Spacebar', 'k', 'K',           // play/pause
-  'ArrowLeft', 'ArrowRight',           // seek 5s
-  'j', 'J', 'l', 'L',                  // seek 10s
-  '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', // seek %
-  ',', '.'                             // frame step
-]);
-
-function isUserTyping(el) {
-  if (!el) return false;
-  const tag = el.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
-  if (el.isContentEditable) return true;
-  return false;
-}
-
-let lastBlockedToastAt = 0;
-document.addEventListener('keydown', (e) => {
-  if (!inRoom || isHost) return;
-  if (isUserTyping(e.target)) return;
-  if (!BLOCKED_KEYS.has(e.key)) return;
-  e.preventDefault();
-  e.stopPropagation();
-  // Toast informatif rate-limité (1 toutes les 5s) pour ne pas spammer
-  const now = Date.now();
-  if (now - lastBlockedToastAt > 5000) {
-    lastBlockedToastAt = now;
-    showToast('Tu es invité — seul l\'hôte contrôle la lecture');
-  }
-}, true /* capture phase, passe avant le player */);
-
-// Pas d'enforcement périodique côté invité : c'était ce qui causait des
-// saccades visibles toutes les secondes en cas de petit décalage naturel
-// (buffering, frames perdues). La correction passe désormais uniquement par
-// les events du player et le CHECK_DRIFT du heartbeat (toutes les 3s, seuil 1s).
-
-// Periodically refresh hostState for the background (host only)
+// Refresh périodique du state hôte vers le bg (alimente le heartbeat).
 setInterval(() => {
   if (inRoom && isHost && video) {
     browser.runtime.sendMessage({
@@ -578,7 +514,6 @@ setInterval(() => {
   if (location.href !== lastHref) {
     lastHref = location.href;
     video = null;
-    lastSync = null;
     // Nouvelle page → on réarme l'observer pour retrouver la nouvelle <video>
     stopAdObserver();
     localInAd = false;
@@ -617,7 +552,6 @@ browser.runtime.onMessage.addListener((message) => {
     // Heartbeat invité : reposition uniquement si drift > 1s ou état play/pause incohérent
     if (!video || isHost) return;
     if (localInAd || othersInAd.length > 0) return;
-    lastSync = { currentTime: message.currentTime, paused: message.paused, ts: Date.now() };
     const drift = Math.abs(video.currentTime - message.currentTime);
     const playMismatch = video.paused !== message.paused;
     if (drift > 1.0 || playMismatch) {
@@ -627,7 +561,6 @@ browser.runtime.onMessage.addListener((message) => {
     isHost = !!message.isHost;
     if (message.leftRoom) {
       inRoom = false;
-      lastSync = null;
       othersInAd = [];
       pausedByAdGate = false;
       currentMembers = [];
@@ -649,12 +582,12 @@ browser.runtime.onMessage.addListener((message) => {
     currentMembers = message.members || [];
     if (message.selfPeerId) selfPeerId = message.selfPeerId;
     renderBanner(currentMembers);
-    // Hôte : si quelqu'un n'est pas prêt et qu'on est en lecture, on coupe.
-    if (isHost && video && !video.paused && !localInAd && !allMembersReady()) {
+    // Si quelqu'un n'est pas prêt et qu'on est en lecture, on coupe.
+    if (video && !video.paused && !localInAd && !allMembersReady()) {
       isSyncing = true;
       nativePause(video);
       setTimeout(() => { isSyncing = false; }, 100);
-      showToast('En attente que tous les invités soient prêts');
+      notifyNotReady();
     }
   } else if (message.type === 'OTHERS_IN_AD') {
     othersInAd = message.peers || [];
