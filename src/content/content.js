@@ -99,22 +99,21 @@ function sendVideoEvent(action) {
 function attachVideoListeners(v) {
   v.addEventListener('play', () => {
     if (isSyncing) return;
-    // Gate pub : si quelqu'un est en pub (et pas soi), on bloque la lecture.
-    if (othersInAd.length > 0 && !localInAd) {
-      isSyncing = true;
-      nativePause(video);
-      setTimeout(() => { isSyncing = false; }, 100);
-      return;
-    }
-    // Gate ready : tant que tout le monde n'est pas prêt, on ne peut pas
-    // démarrer la lecture. Pendant une pub locale, on laisse le player
-    // continuer (le gate pub gère ce cas séparément).
-    if (!localInAd && !allMembersReady()) {
-      isSyncing = true;
-      nativePause(video);
-      setTimeout(() => { isSyncing = false; }, 100);
-      notifyNotReady();
-      return;
+    // Gates uniquement quand on est en salle — sinon lecture libre.
+    if (inRoom) {
+      if (othersInAd.length > 0 && !localInAd) {
+        isSyncing = true;
+        nativePause(video);
+        setTimeout(() => { isSyncing = false; }, 100);
+        return;
+      }
+      if (!localInAd && !allMembersReady()) {
+        isSyncing = true;
+        nativePause(video);
+        setTimeout(() => { isSyncing = false; }, 100);
+        notifyNotReady();
+        return;
+      }
     }
     sendVideoEvent('play');
   });
