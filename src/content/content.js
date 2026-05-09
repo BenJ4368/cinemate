@@ -198,14 +198,20 @@ let toastContainer = null;
 const TOAST_DURATION_MS = 3000;
 
 function ensureToastContainer() {
-  if (toastContainer && document.body.contains(toastContainer)) return toastContainer;
+  const player = document.querySelector('#movie_player');
+  const parent = player || document.body;
+  if (toastContainer && toastContainer.parentNode === parent && document.body.contains(toastContainer)) {
+    return toastContainer;
+  }
+  if (toastContainer && toastContainer.parentNode) toastContainer.parentNode.removeChild(toastContainer);
   toastContainer = document.createElement('div');
   toastContainer.id = 'cinemate-toast-container';
   toastContainer.setAttribute('role', 'status');
   toastContainer.setAttribute('aria-live', 'polite');
   toastContainer.setAttribute('aria-atomic', 'false');
+  const isInPlayer = parent !== document.body;
   toastContainer.style.cssText = [
-    'position:fixed',
+    isInPlayer ? 'position:absolute' : 'position:fixed',
     'top:16px',
     'right:16px',
     'z-index:2147483647',
@@ -215,7 +221,10 @@ function ensureToastContainer() {
     'pointer-events:none',
     'max-width:340px'
   ].join(';');
-  document.body.appendChild(toastContainer);
+  if (isInPlayer && getComputedStyle(parent).position === 'static') {
+    parent.style.position = 'relative';
+  }
+  parent.appendChild(toastContainer);
   return toastContainer;
 }
 
