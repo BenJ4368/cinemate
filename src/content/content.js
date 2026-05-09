@@ -85,11 +85,14 @@ function registerVideo() {
   }).catch(() => {});
 }
 
+let lastLocalActionAt = 0;
+
 function sendVideoEvent(action) {
   if (!video || !inRoom || isSyncing) return;
   // Pendant sa propre pub : pas de broadcast (sinon les seek/play du lecteur
   // d'ad parasitent les autres — currentTime saute à 0, etc).
   if (localInAd) return;
+  lastLocalActionAt = Date.now();
   browser.runtime.sendMessage({
     type: 'VIDEO_EVENT',
     action,
@@ -148,7 +151,15 @@ function attachVideoListeners(v) {
 function applySync(msg) {
   if (!video) return;
   isSyncing = true;
-  nativeSetCurrentTime(video, msg.currentTime);
+  // On ne seek que pour les actions qui impliquent un déplacement explicite
+  // (seek, INITIAL_STATE, drift correction). Pour play/pause/rate, le
+  // currentTime de l'émetteur peut être en retard (vidéo en cours de
+  // chargement) — appliquer ce seek ferait reculer le lecteur des autres
+  // à chaque event. La position est rattrapée naturellement par le heartbeat.
+  const isStateOnly = msg.action === 'play' || msg.action === 'pause' || msg.action === 'rate';
+  if (!isStateOnly) {
+    nativeSetCurrentTime(video, msg.currentTime);
+  }
   if (msg.paused) {
     nativePause(video);
   } else {
@@ -563,6 +574,10 @@ browser.runtime.onMessage.addListener((message) => {
     // Heartbeat invité : reposition uniquement si drift > 1s ou état play/pause incohérent
     if (!video || isHost) return;
     if (localInAd || othersInAd.length > 0) return;
+    // Anti-race : si on vient juste d'émettre une action locale, ignorer le
+    // heartbeat (potentiellement antérieur à notre action) qui sinon
+    // l'écraserait (ex : pause locale rejouée par un heartbeat play stale).
+    if (Date.now() - lastLocalActionAt < 2000) return;
     const drift = Math.abs(video.currentTime - message.currentTime);
     const playMismatch = video.paused !== message.paused;
     if (drift > 1.0 || playMismatch) {

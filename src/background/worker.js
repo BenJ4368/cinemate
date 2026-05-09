@@ -310,12 +310,16 @@ function setupHostConnection(room, conn) {
         notifyMembersUpdate(room);
       }
     } else if (msg.type === 'VIDEO_EVENT') {
-      // Action venant d'un invité : on l'applique côté hôte et on la relaie
-      // aux autres invités. Ça remplace la privation de contrôle invité —
-      // tout le monde peut désormais interagir avec le lecteur.
+      // Action venant d'un invité : appliquer côté hôte + relayer aux autres
+      // invités. Pour play/pause/rate, on ne touche pas à hostStates.currentTime
+      // (le currentTime émis par l'invité peut être en retard) ; le heartbeat
+      // utilisera la position réelle de l'hôte (mise à jour par le setInterval
+      // 2s côté content).
+      const isSeek = msg.action === 'seek';
+      const prevState = hostStates.get(room.windowId);
       hostStates.set(room.windowId, {
         url: msg.url,
-        currentTime: msg.currentTime,
+        currentTime: isSeek ? msg.currentTime : (prevState ? prevState.currentTime : msg.currentTime),
         paused: msg.paused,
         recordedAt: Date.now()
       });
