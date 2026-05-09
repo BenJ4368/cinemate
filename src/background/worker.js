@@ -162,12 +162,16 @@ function startHostHeartbeat(room) {
     if (!room.isHost) return;
     const state = hostStates.get(room.windowId);
     if (!state) return;
+    // Projection sur l'horloge locale de l'hôte avant broadcast : pas de
+    // cross-clock côté invité. L'invité ajoutera le transit (RTT/2) mesuré.
+    const projectedCurrentTime = state.paused
+      ? state.currentTime
+      : state.currentTime + (Date.now() - state.recordedAt) / 1000;
     broadcast(room, {
       type: 'HEARTBEAT',
       url: state.url,
-      currentTime: state.currentTime,
-      paused: state.paused,
-      recordedAt: state.recordedAt
+      currentTime: projectedCurrentTime,
+      paused: state.paused
     });
   }, HEARTBEAT_MS);
 }
@@ -209,16 +213,22 @@ async function followHostUrl(room, msg) {
         }
       }
       await browser.tabs.update(target, { url: msg.url });
-      // Wait for the new page's content script before applying sync
+      // Wait for the new page's content script before applying sync.
+      // msg.currentTime déjà projeté à host_now côté hôte. On ajoute le transit
+      // (RTT/2) + le délai d'attente pour rattraper la lecture qui a continué.
+      const REDIRECT_WAIT_MS = 2500;
       setTimeout(() => {
-        const projected = msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000);
+        const transit = guestTransitSeconds(room);
+        const projected = msg.paused
+          ? msg.currentTime
+          : msg.currentTime + transit + REDIRECT_WAIT_MS / 1000;
         sendToContent(room.windowId, {
           type: 'APPLY_SYNC',
           action: 'seek',
           currentTime: projected,
           paused: msg.paused
         });
-      }, 2500);
+      }, REDIRECT_WAIT_MS);
       return true;
     } catch (e) {
       console.warn('[cinemate] could not redirect tab', e);
@@ -245,6 +255,24 @@ function notifyAdStates(room) {
     if (member) peers.push({ peerId, pseudo: member.pseudo });
   }
   sendToContent(room.windowId, { type: 'OTHERS_IN_AD', peers });
+}
+
+// Mesure RTT côté invité via PING/PONG sur DataChannel. Transit one-way
+// estimé = RTT/2. Sert à projeter les timecodes hôte→invité sans dépendre
+// d'horloges synchronisées (skew NTP entre machines).
+const RTT_PING_MS = 10000;
+function startRttPings(room, conn) {
+  if (room.rttInterval) clearInterval(room.rttInterval);
+  const sendPing = () => {
+    if (!conn.open) return;
+    try { conn.send(JSON.stringify({ type: 'PING', t0: Date.now() })); } catch (_) {}
+  };
+  sendPing();
+  room.rttInterval = setInterval(sendPing, RTT_PING_MS);
+}
+
+function guestTransitSeconds(room) {
+  return room.rttMs ? room.rttMs / 2 / 1000 : 0;
 }
 
 function broadcastAdStates(room) {
@@ -309,6 +337,9 @@ function setupHostConnection(room, conn) {
         member.ready = !!msg.ready;
         notifyMembersUpdate(room);
       }
+    } else if (msg.type === 'PING') {
+      // Renvoi immédiat avec t0 inchangé pour que l'invité calcule RTT.
+      try { conn.send(JSON.stringify({ type: 'PONG', t0: msg.t0 })); } catch (_) {}
     } else if (msg.type === 'VIDEO_EVENT') {
       // Action venant d'un invité : appliquer côté hôte + relayer aux autres
       // invités. Pour play/pause/rate, on ne touche pas à hostStates.currentTime
@@ -362,38 +393,49 @@ function setupGuestConnection(room, conn) {
   conn.on('open', () => {
     room.connections.set(conn.peer, conn);
     conn.send(JSON.stringify({ type: 'HELLO', pseudo: room.pseudo }));
+    startRttPings(room, conn);
   });
 
   conn.on('data', async (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (_) { return; }
 
-    if (msg.type === 'INITIAL_STATE') {
+    if (msg.type === 'PONG') {
+      const rtt = Date.now() - msg.t0;
+      if (rtt >= 0 && rtt < 10000) {
+        // Lissage exponentiel pour amortir les variations.
+        room.rttMs = room.rttMs ? Math.round(room.rttMs * 0.6 + rtt * 0.4) : rtt;
+      }
+    } else if (msg.type === 'INITIAL_STATE') {
       const redirected = await followHostUrl(room, msg);
       if (!redirected) {
+        const transit = guestTransitSeconds(room);
         sendToContent(room.windowId, {
           type: 'APPLY_SYNC',
           action: 'seek',
-          currentTime: msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000),
+          currentTime: msg.currentTime + (msg.paused ? 0 : transit),
           paused: msg.paused
         });
       }
     } else if (msg.type === 'VIDEO_EVENT') {
+      // Pas de projection : applySync skippe le seek pour play/pause/rate ;
+      // pour seek, on applique le target absolu tel quel.
       sendToContent(room.windowId, {
         type: 'APPLY_SYNC',
         action: msg.action,
-        currentTime: msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000),
+        currentTime: msg.currentTime,
         paused: msg.paused
       });
     } else if (msg.type === 'HEARTBEAT') {
-      // Suivi d'URL : si l'hôte a changé de vidéo, on redirige l'onglet invité.
       const redirected = await followHostUrl(room, msg);
       if (!redirected) {
-        // Sinon on demande au content script de vérifier le drift (>1s déclenche reposition).
-        const projected = msg.currentTime + (msg.paused ? 0 : (Date.now() - msg.recordedAt) / 1000);
+        // msg.currentTime déjà projeté à host_now côté hôte.
+        // On ajoute le transit one-way (RTT/2) pour rattraper la position
+        // réelle de l'hôte au moment où on applique.
+        const transit = guestTransitSeconds(room);
         sendToContent(room.windowId, {
           type: 'CHECK_DRIFT',
-          currentTime: projected,
+          currentTime: msg.currentTime + (msg.paused ? 0 : transit),
           paused: msg.paused
         });
       }
@@ -551,6 +593,7 @@ function leaveRoom(windowId) {
   // émettre le toast "hôte parti" alors que c'est nous qui partons.
   room.leaving = true;
   stopHostHeartbeat(room);
+  if (room.rttInterval) { clearInterval(room.rttInterval); room.rttInterval = null; }
   for (const conn of room.connections.values()) {
     try { conn.close(); } catch (_) {}
   }

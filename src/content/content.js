@@ -113,15 +113,9 @@ function showAdToast() {
 function attachVideoListeners(v) {
   v.addEventListener('play', () => {
     if (isSyncing) return;
-    // Pub locale : on bloque le player en pause et on n'émet rien.
-    if (localInAd) {
-      isSyncing = true;
-      nativePause(video);
-      setTimeout(() => { isSyncing = false; }, 100);
-      showAdToast();
-      return;
-    }
-    if (inRoom && !allMembersReady()) {
+    // Pub locale : on laisse jouer (sinon timer ad bloqué). sendVideoEvent
+    // skippe déjà le broadcast pendant localInAd.
+    if (inRoom && !localInAd && !allMembersReady()) {
       isSyncing = true;
       nativePause(video);
       setTimeout(() => { isSyncing = false; }, 100);
@@ -373,12 +367,13 @@ function renderBanner(members) {
 }
 
 // ----- Détection pub -----
-// Quand la pub démarre localement on fige le player en pause et on cesse de
-// broadcast (sinon les seek/play du lecteur d'ad parasitent les autres). Les
-// autres participants continuent leur lecture, on resync à la sortie de pub.
+// Option B : pendant qu'un peer est en pub, les autres pausent (et reprennent
+// auto à la fin). Le peer en pub joue sa pub localement sans broadcast (sinon
+// les seek/play du lecteur d'ad parasitent les autres).
 
 let localInAd = false;
 let othersInAd = []; // [{ peerId, pseudo }]
+let pausedByAdGate = false;
 let adBanner = null;
 let adObserver = null;
 
@@ -398,20 +393,39 @@ function publishAdState() {
     browser.runtime.sendMessage({ type: 'AD_STATE', inAd }).catch(() => {});
   }
   if (inAd) {
-    // Entrée en pub : on fige immédiatement le player + toast.
-    if (video && !video.paused) {
-      isSyncing = true;
-      nativePause(video);
-      setTimeout(() => { isSyncing = false; }, 100);
-    }
+    // On NE force PAS la pause locale : couper le video element met aussi en
+    // pause le timer interne de la pub YouTube → deadlock. On laisse la pub
+    // jouer ; sendVideoEvent skippe déjà le broadcast pendant localInAd.
     showAdToast();
   } else if (wasInAd && inRoom && !isHost) {
     // Sortie de pub : resync sur l'hôte sans attendre le heartbeat.
     browser.runtime.sendMessage({ type: 'REQUEST_SYNC' }).catch(() => {});
   }
-  // Re-render pour que l'icône 😴 du membre soit à jour.
+  applyAdGate();
   if (currentMembers.length) renderBanner(currentMembers);
   renderAdBanner();
+}
+
+function applyAdGate() {
+  // Option B : pause locale si quelqu'un d'autre est en pub (pas soi-même).
+  // Reprise auto quand le gate se libère.
+  const shouldGate = othersInAd.length > 0 && !localInAd;
+  if (shouldGate) {
+    if (video && !video.paused) {
+      isSyncing = true;
+      nativePause(video);
+      pausedByAdGate = true;
+      setTimeout(() => { isSyncing = false; }, 100);
+    }
+  } else if (pausedByAdGate && !localInAd) {
+    if (video && video.paused) {
+      isSyncing = true;
+      const p = nativePlay(video);
+      if (p && typeof p.then === 'function') p.catch(() => {});
+      setTimeout(() => { isSyncing = false; }, 100);
+    }
+    pausedByAdGate = false;
+  }
 }
 
 function startAdObserver() {
@@ -540,6 +554,7 @@ setInterval(() => {
     // Nouvelle page → on réarme l'observer pour retrouver la nouvelle <video>
     stopAdObserver();
     localInAd = false;
+    pausedByAdGate = false;
     // Nouvelle vidéo en cours de chargement → on n'est plus prêt.
     if (inRoom && !isHost && hasSentReady) {
       browser.runtime.sendMessage({ type: 'SET_READY', ready: false }).catch(() => {});
@@ -588,6 +603,7 @@ browser.runtime.onMessage.addListener((message) => {
     if (message.leftRoom) {
       inRoom = false;
       othersInAd = [];
+      pausedByAdGate = false;
       currentMembers = [];
       selfPeerId = null;
       hasSentReady = false;
@@ -616,7 +632,7 @@ browser.runtime.onMessage.addListener((message) => {
     }
   } else if (message.type === 'OTHERS_IN_AD') {
     othersInAd = message.peers || [];
-    // Re-render banner pour refléter qui est en pub via emoji 😴.
+    applyAdGate();
     if (currentMembers.length) renderBanner(currentMembers);
     renderAdBanner();
   } else if (message.type === 'SHOW_TOAST') {
