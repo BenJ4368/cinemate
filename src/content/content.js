@@ -270,7 +270,6 @@ function memberInAd(peerId) {
 
 function statusIcon(member) {
   if (memberInAd(member.peerId)) return { icon: '😴', label: 'En pub', color: '#ff9b3a' };
-  if (member.isHost) return { icon: '⭐', label: 'Hôte', color: '#f5c542' };
   if (member.ready) return { icon: '🍿', label: 'Prêt', color: '#7ed957' };
   return { icon: '⏳', label: 'Pas prêt', color: '#d4a857' };
 }
@@ -623,12 +622,12 @@ browser.runtime.onMessage.addListener((message) => {
     currentMembers = message.members || [];
     if (message.selfPeerId) selfPeerId = message.selfPeerId;
     renderBanner(currentMembers);
-    // Si quelqu'un n'est pas prêt et qu'on est en lecture, on coupe.
+    // Si quelqu'un n'est pas prêt et qu'on est en lecture, on coupe (silencieux).
+    // Le toast n'apparaît que sur refus de commande (cf. play listener).
     if (video && !video.paused && !localInAd && !allMembersReady()) {
       isSyncing = true;
       nativePause(video);
       setTimeout(() => { isSyncing = false; }, 100);
-      notifyNotReady();
     }
   } else if (message.type === 'OTHERS_IN_AD') {
     othersInAd = message.peers || [];
