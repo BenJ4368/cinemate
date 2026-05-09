@@ -87,6 +87,9 @@ function registerVideo() {
 
 function sendVideoEvent(action) {
   if (!video || !inRoom || isSyncing) return;
+  // Pendant sa propre pub : pas de broadcast (sinon les seek/play du lecteur
+  // d'ad parasitent les autres — currentTime saute à 0, etc).
+  if (localInAd) return;
   browser.runtime.sendMessage({
     type: 'VIDEO_EVENT',
     action,
@@ -96,24 +99,31 @@ function sendVideoEvent(action) {
   }).catch(() => {});
 }
 
+let lastAdToastAt = 0;
+function showAdToast() {
+  const now = Date.now();
+  if (now - lastAdToastAt < 5000) return;
+  lastAdToastAt = now;
+  showToast('Publicité en cours');
+}
+
 function attachVideoListeners(v) {
   v.addEventListener('play', () => {
     if (isSyncing) return;
-    // Gates uniquement quand on est en salle — sinon lecture libre.
-    if (inRoom) {
-      if (othersInAd.length > 0 && !localInAd) {
-        isSyncing = true;
-        nativePause(video);
-        setTimeout(() => { isSyncing = false; }, 100);
-        return;
-      }
-      if (!localInAd && !allMembersReady()) {
-        isSyncing = true;
-        nativePause(video);
-        setTimeout(() => { isSyncing = false; }, 100);
-        notifyNotReady();
-        return;
-      }
+    // Pub locale : on bloque le player en pause et on n'émet rien.
+    if (localInAd) {
+      isSyncing = true;
+      nativePause(video);
+      setTimeout(() => { isSyncing = false; }, 100);
+      showAdToast();
+      return;
+    }
+    if (inRoom && !allMembersReady()) {
+      isSyncing = true;
+      nativePause(video);
+      setTimeout(() => { isSyncing = false; }, 100);
+      notifyNotReady();
+      return;
     }
     sendVideoEvent('play');
   });
@@ -292,8 +302,11 @@ function renderBanner(members) {
     return a.pseudo.localeCompare(b.pseudo);
   });
 
-  for (const m of sorted) {
-    const isSelf = m.peerId === selfPeerId;
+  const MAX_VISIBLE = 5;
+  const visible = sorted.slice(0, MAX_VISIBLE);
+  const extra = sorted.length - visible.length;
+
+  for (const m of visible) {
     const row = document.createElement('div');
     row.style.cssText = [
       'display:flex',
@@ -311,11 +324,24 @@ function renderBanner(members) {
 
     const nameEl = document.createElement('span');
     nameEl.style.cssText = 'flex:1;color:#fff5d6;' + (m.isHost ? 'font-weight:700;color:#f5c542;' : '');
-    nameEl.textContent = m.pseudo + (isSelf ? ' (toi)' : '');
+    nameEl.textContent = m.pseudo;
 
     row.appendChild(statusEl);
     row.appendChild(nameEl);
     el.appendChild(row);
+  }
+
+  if (extra > 0) {
+    const extraRow = document.createElement('div');
+    extraRow.style.cssText = [
+      'text-align:center',
+      'color:#d4a857',
+      'font-size:11px',
+      'font-style:italic',
+      'padding:4px 2px'
+    ].join(';');
+    extraRow.textContent = `+${extra} autre${extra > 1 ? 's' : ''}`;
+    el.appendChild(extraRow);
   }
 
   // Hint quand le gate "pas prêt" est actif (s'applique à tout le monde).
@@ -335,11 +361,13 @@ function renderBanner(members) {
   }
 }
 
-// ----- Détection pub + gate (option B : tous en pause si quelqu'un a une pub) -----
+// ----- Détection pub -----
+// Quand la pub démarre localement on fige le player en pause et on cesse de
+// broadcast (sinon les seek/play du lecteur d'ad parasitent les autres). Les
+// autres participants continuent leur lecture, on resync à la sortie de pub.
 
 let localInAd = false;
 let othersInAd = []; // [{ peerId, pseudo }]
-let pausedByAdGate = false;
 let adBanner = null;
 let adObserver = null;
 
@@ -358,11 +386,21 @@ function publishAdState() {
   if (inRoom) {
     browser.runtime.sendMessage({ type: 'AD_STATE', inAd }).catch(() => {});
   }
-  // Pub locale terminée → resync immédiat sans attendre le heartbeat.
-  if (wasInAd && !inAd && inRoom && !isHost) {
+  if (inAd) {
+    // Entrée en pub : on fige immédiatement le player + toast.
+    if (video && !video.paused) {
+      isSyncing = true;
+      nativePause(video);
+      setTimeout(() => { isSyncing = false; }, 100);
+    }
+    showAdToast();
+  } else if (wasInAd && inRoom && !isHost) {
+    // Sortie de pub : resync sur l'hôte sans attendre le heartbeat.
     browser.runtime.sendMessage({ type: 'REQUEST_SYNC' }).catch(() => {});
   }
-  applyAdGate();
+  // Re-render pour que l'icône 😴 du membre soit à jour.
+  if (currentMembers.length) renderBanner(currentMembers);
+  renderAdBanner();
 }
 
 function startAdObserver() {
@@ -379,31 +417,6 @@ function startAdObserver() {
 
 function stopAdObserver() {
   if (adObserver) { adObserver.disconnect(); adObserver = null; }
-}
-
-function applyAdGate() {
-  const shouldGate = othersInAd.length > 0 && !localInAd;
-  if (shouldGate) {
-    if (video && !video.paused) {
-      isSyncing = true;
-      nativePause(video);
-      pausedByAdGate = true;
-      setTimeout(() => { isSyncing = false; }, 100);
-    }
-  } else if (pausedByAdGate && !localInAd) {
-    // Gate libéré → reprise auto. L'hôte se réaligne via son heartbeat ;
-    // les invités attendront le prochain APPLY_SYNC/CHECK_DRIFT.
-    if (video && video.paused) {
-      isSyncing = true;
-      const p = nativePlay(video);
-      if (p && typeof p.then === 'function') p.catch(() => {});
-      setTimeout(() => { isSyncing = false; }, 100);
-    }
-    pausedByAdGate = false;
-  }
-  renderAdBanner();
-  // Statuts "en pub" dans la liste membres → re-render à chaque changement.
-  if (currentMembers.length) renderBanner(currentMembers);
 }
 
 function renderAdBanner() {
@@ -516,7 +529,6 @@ setInterval(() => {
     // Nouvelle page → on réarme l'observer pour retrouver la nouvelle <video>
     stopAdObserver();
     localInAd = false;
-    pausedByAdGate = false;
     // Nouvelle vidéo en cours de chargement → on n'est plus prêt.
     if (inRoom && !isHost && hasSentReady) {
       browser.runtime.sendMessage({ type: 'SET_READY', ready: false }).catch(() => {});
@@ -561,7 +573,6 @@ browser.runtime.onMessage.addListener((message) => {
     if (message.leftRoom) {
       inRoom = false;
       othersInAd = [];
-      pausedByAdGate = false;
       currentMembers = [];
       selfPeerId = null;
       hasSentReady = false;
@@ -590,7 +601,9 @@ browser.runtime.onMessage.addListener((message) => {
     }
   } else if (message.type === 'OTHERS_IN_AD') {
     othersInAd = message.peers || [];
-    applyAdGate();
+    // Re-render banner pour refléter qui est en pub via emoji 😴.
+    if (currentMembers.length) renderBanner(currentMembers);
+    renderAdBanner();
   } else if (message.type === 'SHOW_TOAST') {
     showToast(message.message || '');
   } else if (message.type === 'PING') {
